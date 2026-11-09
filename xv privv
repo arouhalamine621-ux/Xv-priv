@@ -1,0 +1,297 @@
+-- ================================================================
+-- XV PATCH — ADMIN PANEL FULL REMOVAL + DETECTION NOTES
+-- File: xv_admin_kill.lua
+-- Drop BEFORE the main XV loader line. Safe to run with the rest of
+-- the XV patch stack. All sections guarded against double-execution.
+-- ================================================================
+
+do if rawget(_G, "_XV_AdminKillPatched") then return end end
+rawset(_G, "_XV_AdminKillPatched", true)
+
+-- ----------------------------------------------------------------
+-- DETECTION SURFACE IN XV PRIVATE (what the anticheat sees)
+-- ----------------------------------------------------------------
+-- The following are the confirmed detectable signals in this build:
+--
+-- [D1] XiProxViz — BasePart named "XiProxViz" parented to Workspace
+--      root. AC scans workspace root for unexpected named parts. This
+--      is the circle indicator. Already killed in patch v2 [PATCH 1].
+--
+-- [D2] XiAdminPanel ScreenGui — parented to PlayerGui or gethui().
+--      AC can enumerate PlayerGui children and flag non-game GUIs by
+--      name. Any ScreenGui with "Xi" or "Admin" in the name is a hot
+--      pattern. This patch kills it.
+--
+-- [D3] XiAdminToolsPanel ScreenGui — same surface, same risk. Killed.
+--
+-- [D4] XiTempPlatform — Anchored neon-red Part parented to Workspace
+--      during F3 recovery. AC flags unexpected anchored parts at root.
+--      Already managed by JAF_DestroyAllF3Platforms; this patch adds
+--      a persistent watcher to auto-nuke any that linger.
+--
+-- [D5] DoubleRig — Model injected into the player's workspace folder
+--      during lagback. AC watches for DoubleRig by name. Covered in
+--      the lagback debounce patch [PATCH 3]. Belt-and-suspenders guard
+--      added here too.
+--
+-- [D6] ProxCircle config flag — if ShowProxCircle / ProxCircleEnabled
+--      is true the renderer re-adds XiProxViz each frame. Already
+--      zeroed in [PATCH 1]. Reinforced here.
+--
+-- [D7] ClickToAP / ProximityAP remote fire — the admin panel fires
+--      proximity prompt triggers programmatically. Modern AC builds
+--      hook ProximityPrompt.Triggered on the server and flag clients
+--      that fire steal prompts outside their physical range. With the
+--      admin panel disabled neither ClickToAP nor ProximityAP can
+--      fire out-of-range prompts. Killed by zeroing all flags.
+--
+-- [D8] RoseCamp base-camping — continuously fires steal prompts in
+--      a target's base using SharedState.SetManualTarget pointed at
+--      a plot the local player is not standing in. Flagged the same
+--      as D7. Camp is not removed (it's a legit autosteal feature)
+--      but the admin panel button that starts it is gone so it can
+--      only be used if Sam calls RoseCamp.start() manually.
+--
+-- NOT DETECTED (confirmed safe):
+--   - JAF_* globals on _G     (client-side, server cannot read _G)
+--   - AssemblyLinearVelocity  (client-auth position, expected)
+--   - Config flags in _G       (client-side table, not replicated)
+--   - ScreenGui in gethui()    (server cannot enumerate gethui)
+--   - Heartbeat connections    (not inspectable from server)
+-- ----------------------------------------------------------------
+
+-- ================================================================
+-- [1] Zero all admin-panel config flags
+-- Runs immediately and again once Config resolves, so the panel
+-- never builds even if the loader beats us to it.
+-- ================================================================
+local function _zeroAdminFlags()
+    local cfg = _G.XV_Config or rawget(_G, "Config")
+    if type(cfg) ~= "table" then return false end
+
+    cfg.HideAdminPanel           = true
+    cfg.ClickToAP                = false
+    cfg.ClickToAPKeybind         = ""
+    cfg.ClickToAPSingleCommand   = false
+    cfg.ProximityAP              = false
+    cfg.ProximityAPKeybind       = ""
+    cfg.ProximityRange           = 0
+
+    -- wipe the button cache so stale callbacks cannot fire
+    if type(cfg.AdminButtonCache) == "table" then
+        for k in next, cfg.AdminButtonCache do cfg.AdminButtonCache[k] = nil end
+    else
+        cfg.AdminButtonCache = {}
+    end
+
+    -- also zero the AdminPanel position so it doesn't drift back in
+    if type(cfg.Positions) == "table" then
+        cfg.Positions.AdminPanel = nil
+    end
+
+    -- ProxCircle belt-and-suspenders (complement to ProxCircle patch)
+    cfg.ShowProxCircle    = false
+    cfg.ProxCircleEnabled = false
+    cfg.ProxCircleRadius  = 0
+
+    return true
+end
+
+-- immediate attempt (may be before Config exists)
+_zeroAdminFlags()
+
+-- deferred attempt after Config resolves
+task.defer(function()
+    local t0 = os.clock()
+    repeat task.wait(0.1) until _zeroAdminFlags() or os.clock() - t0 > 15
+end)
+
+-- ================================================================
+-- [2] Destroy XiAdminPanel and XiAdminToolsPanel GUIs
+-- Three host targets: gethui(), CoreGui, PlayerGui.
+-- Runs immediately, then watches for re-adds.
+-- ================================================================
+do
+    local _adminGuiNames = {
+        XiAdminPanel       = true,
+        XiAdminToolsPanel  = true,
+    }
+
+    local function _killAdminGuis(container)
+        if not container then return end
+        for _, g in ipairs(container:GetChildren()) do
+            if _adminGuiNames[g.Name] then
+                pcall(function() g:Destroy() end)
+            end
+        end
+    end
+
+    local function _getHosts()
+        local hosts = {}
+        pcall(function()
+            if gethui then local h = gethui(); if h then hosts[#hosts + 1] = h end end
+        end)
+        pcall(function()
+            local cg = game:GetService("CoreGui"); if cg then hosts[#hosts + 1] = cg end
+        end)
+        pcall(function()
+            local pg = game:GetService("Players").LocalPlayer
+            if pg then
+                local gui = pg:FindFirstChildOfClass("PlayerGui")
+                if gui then hosts[#hosts + 1] = gui end
+            end
+        end)
+        return hosts
+    end
+
+    -- immediate sweep
+    for _, host in ipairs(_getHosts()) do _killAdminGuis(host) end
+
+    -- watch for re-adds (the hub may rebuild on theme change, etc.)
+    task.defer(function()
+        for _, host in ipairs(_getHosts()) do
+            pcall(function()
+                host.ChildAdded:Connect(function(c)
+                    if _adminGuiNames[c.Name] then
+                        task.defer(function() pcall(function() c:Destroy() end) end)
+                    end
+                end)
+            end)
+        end
+    end)
+end
+
+-- ================================================================
+-- [3] Block buildJustAFanSettingsUI from rendering the Admin tab
+-- The settings panel is rebuilt often (theme change, retarget, etc.).
+-- We wrap the builder to strip the Admin tab from its nav list after
+-- every build. The rest of the settings panel is left fully intact.
+-- ================================================================
+do
+    local _ADMIN_TAB_IDS = {
+        ["admin"]    = true,
+        ["Admin"]    = true,
+        ["ADMIN"]    = true,
+        ["adm"]      = true,
+    }
+
+    -- Strip admin tab buttons and their linked scroll frames from a panel.
+    -- The hub names tabs after their id text; we match by TextLabel content.
+    local function _stripAdminTab(panel)
+        if not panel or not panel.Parent then return end
+        for _, child in ipairs(panel:GetDescendants()) do
+            pcall(function()
+                -- nav buttons contain a TextLabel named "TabLbl"
+                local lbl = child:IsA("GuiObject") and child:FindFirstChild("TabLbl")
+                if lbl and lbl:IsA("TextLabel") then
+                    local t = tostring(lbl.Text or ""):lower()
+                    if t:find("admin") then
+                        child:Destroy()
+                        return
+                    end
+                end
+                -- also kill any Frame/ScrollingFrame named after the admin tab
+                if child:IsA("GuiObject") then
+                    local n = child.Name:lower()
+                    if n:find("admin") and not n:find("panel") then
+                        -- don't destroy the main panel itself, only tab content
+                        if child.Parent and child.Parent ~= panel then
+                            child:Destroy()
+                        end
+                    end
+                end
+            end)
+        end
+    end
+
+    local function _patchBuilder()
+        local orig = rawget(_G, "buildJustAFanSettingsUI")
+        if type(orig) ~= "function" then return false end
+        if rawget(_G, "_XV_AdminTabPatched") then return true end
+        rawset(_G, "_XV_AdminTabPatched", true)
+
+        rawset(_G, "buildJustAFanSettingsUI", function(...)
+            local ok, err = pcall(orig, ...)
+            -- after every build, strip the admin tab from the resulting panel
+            task.defer(function()
+                local ui = rawget(_G, "JustAFanSettingsUI")
+                local panel = ui and rawget(ui, "panel")
+                if panel then pcall(_stripAdminTab, panel) end
+                -- also sweep the ScreenGui directly
+                local pg = game:GetService("Players").LocalPlayer
+                local pGui = pg and pg:FindFirstChildOfClass("PlayerGui")
+                local sg = pGui and pGui:FindFirstChild("JustAFanSettings")
+                if sg then pcall(_stripAdminTab, sg) end
+            end)
+            if not ok then
+                warn("[XV ADMIN KILL] buildJustAFanSettingsUI: " .. tostring(err))
+            end
+        end)
+        return true
+    end
+
+    if not _patchBuilder() then
+        task.spawn(function()
+            local t0 = os.clock()
+            repeat task.wait(0.15) until _patchBuilder() or os.clock() - t0 > 20
+        end)
+    end
+end
+
+-- ================================================================
+-- [4] Kill XiTempPlatform (D4) — persistent workspace watcher
+-- F3 recovery creates a neon Part named XiTempPlatform at workspace
+-- root. It auto-destroys after 30s normally, but if a session error
+-- prevents the cleanup it sits there flagging. This watcher nukes it
+-- the moment it appears and also does an immediate sweep.
+-- ================================================================
+do
+    local WS = game:GetService("Workspace")
+
+    local function _killTempPlatforms()
+        for _, c in ipairs(WS:GetChildren()) do
+            if c.Name == "XiTempPlatform" then
+                pcall(function() c:Destroy() end)
+            end
+        end
+    end
+
+    _killTempPlatforms()
+
+    WS.ChildAdded:Connect(function(c)
+        if c.Name == "XiTempPlatform" then
+            task.defer(function() pcall(function() c:Destroy() end) end)
+        end
+    end)
+end
+
+-- ================================================================
+-- [5] ClickToAP / ProximityAP runtime kill
+-- Even if something re-enables the flags, intercept the _G functions
+-- that drive them so they silently no-op.
+-- ================================================================
+do
+    -- JAF_ClickToAP fires when ClickToAP is on + player clicked.
+    -- JAF_ProximityAP fires the proximity AP scanner.
+    -- Both are set up inside the settings UI; we override them here
+    -- so even a rebuild can't restore them.
+    local function _noOp() end
+
+    rawset(_G, "JAF_ClickToAP",     _noOp)
+    rawset(_G, "JAF_ProximityAP",   _noOp)
+    rawset(_G, "JAF_TriggerClickAP", _noOp)
+
+    -- re-apply after a rebuild, same pattern as builder patch
+    task.spawn(function()
+        while true do
+            task.wait(2)
+            if rawget(_G, "JAF_ClickToAP")     ~= _noOp then rawset(_G, "JAF_ClickToAP",     _noOp) end
+            if rawget(_G, "JAF_ProximityAP")    ~= _noOp then rawset(_G, "JAF_ProximityAP",   _noOp) end
+            if rawget(_G, "JAF_TriggerClickAP") ~= _noOp then rawset(_G, "JAF_TriggerClickAP", _noOp) end
+        end
+    end)
+end
+
+-- ================================================================
+-- END XV ADMIN PANEL KILL
+-- ================================================================
